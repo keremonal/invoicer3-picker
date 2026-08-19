@@ -1,0 +1,95 @@
+<!doctype html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Select your Invoicer folder</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        html, body {
+            height: 100%;
+            margin: 0;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: #fff;
+            color: #888;
+            font-size: 15px;
+        }
+        #msg { text-align: center; padding: 20px; }
+        #msg.error { color: #c00; }
+    </style>
+</head>
+<body>
+    <div id="msg">Preparing folder picker&hellip;</div>
+    <script src="https://apis.google.com/js/api.js"></script>
+    <script>
+        // Standalone page, deliberately NOT served by Apps Script's HtmlService — it exists
+        // purely because Apps Script's own sandboxed content iframe (script.googleusercontent.com)
+        // makes Google Picker consistently 401 (long-documented, still-unresolved Apps-Script-side
+        // bug). This page runs as a genuine top-level tab instead, where Picker works normally.
+        // It carries no secrets of its own — the OAuth token and API key arrive via postMessage
+        // from the opener, live only in memory, and are never persisted or sent anywhere else.
+        const SRC = 'invoicer-picker';
+        let _token = null, _apiKey = null, _appId = null, _pickerLibReady = false;
+
+        function setMsg(text, isError) {
+            const el = document.getElementById('msg');
+            el.textContent = text;
+            el.className = isError ? 'error' : '';
+        }
+
+        function post(payload) {
+            if (window.opener) window.opener.postMessage(Object.assign({source: SRC}, payload), '*');
+        }
+
+        function showPicker() {
+            const view = new google.picker.DocsView(google.picker.ViewId.FOLDERS)
+                .setSelectFolderEnabled(true)
+                .setIncludeFolders(true);
+            const picker = new google.picker.PickerBuilder()
+                .addView(view)
+                .setOAuthToken(_token)
+                .setDeveloperKey(_apiKey)
+                .setAppId(_appId)
+                .setCallback(function (data) {
+                    if (data.action === google.picker.Action.PICKED) {
+                        post({type: 'selected', folderId: data.docs[0].id});
+                        window.close();
+                    } else if (data.action === google.picker.Action.CANCEL) {
+                        post({type: 'cancel'});
+                        window.close();
+                    }
+                })
+                .build();
+            picker.setVisible(true);
+        }
+
+        function maybeShowPicker() {
+            if (_pickerLibReady && _token) showPicker();
+        }
+
+        window.addEventListener('message', function (e) {
+            // The opener's own origin is unpredictable (Apps Script's content iframe origin
+            // varies per session), so we can't allow-list it by string — instead we check that
+            // the message really came from the window we were opened by.
+            if (e.source !== window.opener) return;
+            if (!e.data || e.data.source !== SRC || e.data.type !== 'init') return;
+            _token = e.data.token;
+            _apiKey = e.data.apiKey;
+            _appId = e.data.appId;
+            maybeShowPicker();
+        });
+
+        if (!window.opener) {
+            setMsg('This page must be opened from Invoicer.', true);
+        } else {
+            gapi.load('picker', function () {
+                _pickerLibReady = true;
+                maybeShowPicker();
+                post({type: 'ready'});
+            });
+        }
+    </script>
+</body>
+</html>
