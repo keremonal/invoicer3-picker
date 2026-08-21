@@ -16,34 +16,44 @@
             color: #333;
         }
         #wrap { text-align: center; padding: 24px; max-width: 320px; }
-        #micBtn {
+        #micDot {
             width: 96px;
             height: 96px;
             border-radius: 50%;
-            border: none;
+            margin: 0 auto;
             background: #007aff;
             color: #fff;
             font-size: 36px;
-            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
             box-shadow: 0 4px 14px rgba(0, 0, 0, 0.15);
         }
-        #micBtn.recording {
+        #micDot.listening {
             background: #ff3b30;
             animation: voice-pulse 1.2s ease-in-out infinite;
         }
-        #micBtn:disabled { opacity: 0.4; cursor: default; }
         @keyframes voice-pulse {
             0%, 100% { box-shadow: 0 0 0 0 rgba(255, 59, 48, 0.45); }
             50% { box-shadow: 0 0 0 14px rgba(255, 59, 48, 0); }
         }
         #msg { margin-top: 16px; font-size: 14px; color: #666; min-height: 20px; }
         #msg.error { color: #c00; }
+        #cancelLink {
+            display: inline-block;
+            margin-top: 14px;
+            font-size: 13px;
+            color: #999;
+            cursor: pointer;
+            text-decoration: underline;
+        }
     </style>
 </head>
 <body>
 <div id="wrap">
-    <button type="button" id="micBtn">🎤</button>
-    <div id="msg">Tap to start recording</div>
+    <div id="micDot">🎤</div>
+    <div id="msg">Starting microphone…</div>
+    <div id="cancelLink">Cancel</div>
 </div>
 <script>
     // Standalone page, deliberately NOT served by Apps Script's HtmlService — same reason as
@@ -52,15 +62,29 @@
     // author has no way to grant, so getUserMedia() fails instantly with no browser prompt at
     // all when called from inside Invoicer's own page. This page runs as a genuine top-level
     // tab instead, where mic access works normally. It carries no secrets and persists nothing —
-    // the recorded clip is handed to the opener over postMessage as soon as recording stops,
-    // then this tab closes itself.
+    // recording starts automatically on load, stops automatically once the speaker goes quiet
+    // (simple RMS-based voice-activity detection, no server round trip needed for that part),
+    // and the clip is handed to the opener over postMessage as soon as it stops. The whole flow
+    // needs zero clicks in the normal case; "Cancel" is just an escape hatch.
     const SRC = 'invoicer-voice';
+    const MIME_CANDIDATES = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', 'audio/mp4'];
+
+    // RMS (0..1) above this counts as "speaking". Ambient room noise typically sits well under
+    // this; normal speaking voice clears it easily. SILENCE_MS is how long it has to stay below
+    // that after speech was heard before we consider the sentence finished.
+    const SPEECH_RMS_THRESHOLD = 0.04;
+    const SILENCE_MS = 1600;
+    const MIN_RECORDING_MS = 500;
+    const MAX_RECORDING_MS = 25000;
+
     let mediaRecorder = null;
     let chunks = [];
-    let isRecording = false;
     let alreadyPosted = false;
-
-    const MIME_CANDIDATES = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', 'audio/mp4'];
+    let audioContext = null;
+    let monitorRafId = null;
+    let recordingStartedAt = 0;
+    let hasHeardSpeech = false;
+    let lastLoudAt = 0;
 
     function post(payload) {
         alreadyPosted = true;
@@ -82,7 +106,57 @@
         });
     }
 
-    async function startRecording() {
+    function getRms_(analyser, buffer) {
+        analyser.getByteTimeDomainData(buffer);
+        let sumSquares = 0;
+        for (let i = 0; i < buffer.length; i++) {
+            const v = (buffer[i] - 128) / 128;
+            sumSquares += v * v;
+        }
+        return Math.sqrt(sumSquares / buffer.length);
+    }
+
+    // Polls mic volume every animation frame. Auto-stops once the speaker has been heard AND
+    // has since gone quiet for SILENCE_MS; MAX_RECORDING_MS is a hard cap in case VAD never
+    // triggers (e.g. constant background noise keeps it "loud").
+    function watchForSilence_(stream) {
+        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        const source = audioContext.createMediaStreamSource(stream);
+        const analyser = audioContext.createAnalyser();
+        analyser.fftSize = 2048;
+        source.connect(analyser); // analysis only — never connected to destination, so the
+                                   // speaker never hears their own voice echoed back.
+        const buffer = new Uint8Array(analyser.fftSize);
+
+        recordingStartedAt = Date.now();
+        lastLoudAt = recordingStartedAt;
+        hasHeardSpeech = false;
+
+        function tick() {
+            const now = Date.now();
+            const elapsed = now - recordingStartedAt;
+            const rms = getRms_(analyser, buffer);
+
+            if (rms > SPEECH_RMS_THRESHOLD) {
+                hasHeardSpeech = true;
+                lastLoudAt = now;
+            }
+
+            if (elapsed > MAX_RECORDING_MS) {
+                stopRecording_();
+                return;
+            }
+            if (hasHeardSpeech && elapsed > MIN_RECORDING_MS && (now - lastLoudAt) > SILENCE_MS) {
+                stopRecording_();
+                return;
+            }
+
+            monitorRafId = requestAnimationFrame(tick);
+        }
+        monitorRafId = requestAnimationFrame(tick);
+    }
+
+    async function startRecording_() {
         if (!navigator.mediaDevices || !window.MediaRecorder) {
             setMsg('This browser does not support voice recording.', true);
             return;
@@ -98,11 +172,10 @@
             });
             mediaRecorder.addEventListener('stop', async function () {
                 stream.getTracks().forEach(track => track.stop());
+                if (audioContext) { audioContext.close(); audioContext = null; }
+
                 if (!chunks.length) {
-                    isRecording = false;
-                    document.getElementById('micBtn').classList.remove('recording');
-                    document.getElementById('micBtn').textContent = '🎤';
-                    setMsg('No audio captured. Tap to try again.', true);
+                    setMsg('No audio captured.', true);
                     return;
                 }
                 setMsg('Sending…');
@@ -113,39 +186,38 @@
             });
 
             mediaRecorder.start();
-            isRecording = true;
-            document.getElementById('micBtn').classList.add('recording');
-            document.getElementById('micBtn').textContent = '⏹';
-            setMsg('Listening… tap to stop');
+            document.getElementById('micDot').classList.add('listening');
+            setMsg('Listening… speak your invoice, then go quiet.');
+            watchForSilence_(stream);
         } catch (err) {
             setMsg('Microphone access was denied.', true);
         }
     }
 
-    function stopRecording() {
+    function stopRecording_() {
+        if (monitorRafId) { cancelAnimationFrame(monitorRafId); monitorRafId = null; }
+        document.getElementById('micDot').classList.remove('listening');
         if (mediaRecorder && mediaRecorder.state !== 'inactive') {
             mediaRecorder.stop();
         }
     }
 
-    document.getElementById('micBtn').addEventListener('click', function () {
-        if (isRecording) {
-            stopRecording();
-        } else {
-            startRecording();
-        }
+    document.getElementById('cancelLink').addEventListener('click', function () {
+        stopRecording_();
+        window.close();
     });
 
     // Fallback "cancel" signal for every way this tab can go away without a recording having
-    // been sent yet (user closes it, navigates away, etc.) — the opener also polls window.closed
-    // as a belt-and-suspenders backup in case beforeunload doesn't fire.
+    // been sent yet — the opener also polls window.closed as a belt-and-suspenders backup in
+    // case beforeunload doesn't fire.
     window.addEventListener('beforeunload', function () {
         if (!alreadyPosted) post({type: 'cancel'});
     });
 
     if (!window.opener) {
         setMsg('This page must be opened from Invoicer.', true);
-        document.getElementById('micBtn').disabled = true;
+    } else {
+        startRecording_();
     }
 </script>
 </body>
